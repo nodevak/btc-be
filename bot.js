@@ -3,20 +3,21 @@
  * Strategy: Williams %R(14) signal + Ichimoku Chikou filter
  * SL: 1.5% | TP: 3.0% | Risk: $10/trade
  *
- * Storage: PostgreSQL (Railway managed)
+ * Commands:
+ *   /stats    — balance, return, win rate, drawdown, indicators
+ *   /position — current open trade details + live P&L
+ *   /history  — last 20 closed trades
+ *   /help     — list all commands
  *
  * Environment variables (set in Railway):
  *   TELEGRAM_TOKEN   — from @BotFather
  *   TELEGRAM_CHAT_ID — your chat ID from @userinfobot
- *   DATABASE_URL     — auto-set by Railway when you add a Postgres service
  */
 
 import fetch from 'node-fetch';
-import pkg from 'pg';
+import fs from 'fs';
 import express from 'express';
 import cors from 'cors';
-
-const { Pool } = pkg;
 
 // ─── CONFIG ─────────────────────────────────────────────────
 const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
@@ -29,56 +30,10 @@ const WR_PERIOD        = 14;
 const CHIKOU_SHIFT     = 26;
 const POLL_INTERVAL_MS = 30 * 1000;
 const CANDLE_LIMIT     = 50;
-
-// ─── POSTGRES ───────────────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Neon and most hosted Postgres providers require SSL
-  ssl: { rejectUnauthorized: false },
-});
-
-// One table, one row — stores the entire bot state as JSONB.
-// Simple and requires zero schema migrations as state evolves.
-async function dbInit() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bot_state (
-      id      INTEGER PRIMARY KEY DEFAULT 1,
-      state   JSONB NOT NULL,
-      updated TIMESTAMPTZ DEFAULT NOW(),
-      CHECK (id = 1)  -- enforce single row
-    )
-  `);
-
-  // Insert default row if it doesn't exist yet
-  await pool.query(`
-    INSERT INTO bot_state (id, state)
-    VALUES (1, $1)
-    ON CONFLICT (id) DO NOTHING
-  `, [JSON.stringify(defaultState())]);
-
-  console.log('Database initialised ✅');
-}
-
-async function loadState() {
-  const res = await pool.query('SELECT state FROM bot_state WHERE id = 1');
-  const saved = res.rows[0].state;
-  // Merge with defaults so new fields are always present
-  return { ...defaultState(), ...saved };
-}
-
-async function saveState() {
-  await pool.query(`
-    UPDATE bot_state
-    SET state = $1, updated = NOW()
-    WHERE id = 1
-  `, [JSON.stringify(state)]);
-}
+const STATE_FILE       = './state.json';
 
 // ─── STATE ──────────────────────────────────────────────────
-// state is loaded from DB async in init() — declared here for scope
-let state = defaultState();
-
-// In-memory only (no need to persist — recalculated on each tick)
+let state       = loadState();
 let lastCandles = [];
 let lastWR      = null;
 
@@ -90,6 +45,19 @@ function defaultState() {
     lastCandleOpen: null,
     pendingSignal:  null,
   };
+}
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE))
+      return { ...defaultState(), ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  } catch (e) { console.error('Could not load state:', e.message); }
+  return defaultState();
+}
+
+function saveState() {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
+  catch (e) { console.error('Could not save state:', e.message); }
 }
 
 // ─── BINANCE API ────────────────────────────────────────────
@@ -136,28 +104,20 @@ function detectSignal(wr, i) {
 }
 
 // ─── TRADE LOGIC ────────────────────────────────────────────
-async function enterTrade(direction, entryPrice, candle) {
+function enterTrade(direction, entryPrice, candle) {
   const slDist  = entryPrice * SL_PCT;
   const sizeBTC = RISK_USD / slDist;
   const sl = direction === 'LONG' ? entryPrice * (1 - SL_PCT) : entryPrice * (1 + SL_PCT);
   const tp = direction === 'LONG' ? entryPrice * (1 + TP_PCT) : entryPrice * (1 - TP_PCT);
 
   state.openTrade = {
-    id:           state.trades.length + 1,
-    direction,
-    entryTime:    new Date(candle.time * 1000).toISOString(),
-    entryPrice,
-    exitTime:     null,
-    exitPrice:    null,
-    sl, tp, sizeBTC,
-    riskUSD:      RISK_USD,
-    pnl:          null,
-    result:       null,
-    exitVia:      null,
-    balanceAfter: null,
+    id: state.trades.length + 1, direction,
+    entryTime: new Date(candle.time * 1000).toISOString(),
+    entryPrice, exitTime: null, exitPrice: null,
+    sl, tp, sizeBTC, riskUSD: RISK_USD,
+    pnl: null, result: null, exitVia: null, balanceAfter: null,
   };
-
-  await saveState();
+  saveState();
 
   const emoji = direction === 'LONG' ? '🟢' : '🔴';
   sendTelegram(
@@ -171,31 +131,23 @@ async function enterTrade(direction, entryPrice, candle) {
   );
 }
 
-async function closeTrade(trade, exitPrice, exitTime, exitVia) {
+function closeTrade(trade, exitPrice, exitTime, exitVia) {
   const dir  = trade.direction === 'LONG' ? 1 : -1;
   const pnl  = (exitPrice - trade.entryPrice) * trade.sizeBTC * dir;
 
-  trade.exitPrice    = exitPrice;
-  trade.exitTime     = exitTime;
-  trade.exitVia      = exitVia;
-  trade.pnl          = pnl;
-  trade.result       = pnl > 0.01 ? 'win' : pnl < -0.01 ? 'loss' : 'be';
-  state.balance     += pnl;
+  trade.exitPrice = exitPrice; trade.exitTime = exitTime;
+  trade.exitVia   = exitVia;   trade.pnl      = pnl;
+  trade.result    = pnl > 0.01 ? 'win' : pnl < -0.01 ? 'loss' : 'be';
+  state.balance  += pnl;
   trade.balanceAfter = state.balance;
   state.trades.push(trade);
-  state.openTrade    = null;
-
-  await saveState();
+  state.openTrade = null;
+  saveState();
 
   const emoji  = trade.result === 'win' ? '✅' : trade.result === 'loss' ? '❌' : '⚪';
   const pnlStr = pnl >= 0 ? `+$${f2(pnl)}` : `-$${f2(Math.abs(pnl))}`;
-  const viaStr = exitVia === 'TP'
-    ? '🎯 Take Profit'
-    : exitVia === 'SL'
-    ? '🛑 Stop Loss'
-    : '⏱ Timeout (reversal)';
-  const ret = (((state.balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 100);
-
+  const viaStr = exitVia === 'TP' ? '🎯 Take Profit' : exitVia === 'SL' ? '🛑 Stop Loss' : '⏱ Timeout (reversal)';
+  const ret    = (((state.balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 100);
   sendTelegram(
     `${emoji} <b>TRADE CLOSED — ${trade.direction} #${trade.id}</b>\n` +
     `Exit via:  ${viaStr}\n` +
@@ -207,42 +159,35 @@ async function closeTrade(trade, exitPrice, exitTime, exitVia) {
   );
 }
 
-async function checkSlTp(candle) {
+function checkSlTp(candle) {
   if (!state.openTrade) return;
   const t        = state.openTrade;
   const exitTime = new Date(candle.time * 1000).toISOString();
   if (t.direction === 'LONG') {
-    if (candle.low  <= t.sl) { await closeTrade(t, t.sl, exitTime, 'SL'); return; }
-    if (candle.high >= t.tp) { await closeTrade(t, t.tp, exitTime, 'TP'); return; }
+    if (candle.low  <= t.sl) { closeTrade(t, t.sl, exitTime, 'SL'); return; }
+    if (candle.high >= t.tp) { closeTrade(t, t.tp, exitTime, 'TP'); return; }
   } else {
-    if (candle.high >= t.sl) { await closeTrade(t, t.sl, exitTime, 'SL'); return; }
-    if (candle.low  <= t.tp) { await closeTrade(t, t.tp, exitTime, 'TP'); return; }
+    if (candle.high >= t.sl) { closeTrade(t, t.sl, exitTime, 'SL'); return; }
+    if (candle.low  <= t.tp) { closeTrade(t, t.tp, exitTime, 'TP'); return; }
   }
 }
 
 // ─── MAIN PROCESSING ────────────────────────────────────────
-async function processCandles(candles, wr) {
-  const closedCount = candles.length - 1; // last candle is still building
+function processCandles(candles, wr) {
+  const closedCount = candles.length - 1;
   if (closedCount < 2) return;
 
   const lastClosed = candles[closedCount - 1];
-
-  // Already up to date
   if (state.lastCandleOpen === lastClosed.time) return;
 
-  // Find the first unprocessed closed candle
   let startIdx = closedCount - 1;
-
   if (state.lastCandleOpen !== null) {
     const found = candles.findIndex(c => c.time === state.lastCandleOpen);
     if (found !== -1) {
       startIdx = found + 1;
     } else {
-      // Bot was offline longer than the fetch window
       startIdx = 0;
-      console.warn('[WARN] Last processed candle not in fetch window — catching up on all available candles.');
-
-      // Cancel stale pending signal — the intended entry candle is gone
+      console.warn('[WARN] Last processed candle not in fetch window — catching up.');
       if (state.pendingSignal) {
         console.warn(`[WARN] Cancelling stale pendingSignal (${state.pendingSignal.direction})`);
         sendTelegram(
@@ -252,9 +197,8 @@ async function processCandles(candles, wr) {
           `Resuming normal signal watching.`
         );
         state.pendingSignal = null;
-        await saveState();
+        saveState();
       }
-
       sendTelegram(
         `⚠️ <b>Catch-up Warning</b>\n` +
         `Bot was offline long enough that some candles fell outside the fetch window.\n` +
@@ -265,37 +209,25 @@ async function processCandles(candles, wr) {
   }
 
   for (let i = startIdx; i < closedCount; i++) {
-    // Step 1: Execute pending entry from previous candle's signal
     if (state.pendingSignal !== null) {
-      await enterTrade(state.pendingSignal.direction, candles[i].open, candles[i]);
+      enterTrade(state.pendingSignal.direction, candles[i].open, candles[i]);
       state.pendingSignal = null;
-      await saveState();
+      saveState();
     }
 
-    // Step 2: Check SL/TP for any open trade
-    if (state.openTrade) {
-      await checkSlTp(candles[i]);
-    }
+    if (state.openTrade) checkSlTp(candles[i]);
 
-    // Step 3: Detect new signal on this closed candle
     if (i >= 1) {
       const signal = detectSignal(wr, i);
       if (signal !== 0) {
         const dir        = signal === 1 ? 'LONG' : 'SHORT';
         const filterPass = checkChikouFilter(candles, i, dir);
-
         if (filterPass) {
           if (state.openTrade) {
             if (state.openTrade.direction !== dir) {
-              // TIMEOUT: close current trade, queue reversal entry
-              await closeTrade(
-                state.openTrade,
-                candles[i].close,
-                new Date(candles[i].time * 1000).toISOString(),
-                'TIMEOUT'
-              );
+              closeTrade(state.openTrade, candles[i].close, new Date(candles[i].time * 1000).toISOString(), 'TIMEOUT');
               state.pendingSignal = { direction: dir };
-              await saveState();
+              saveState();
               sendTelegram(
                 `${dir === 'LONG' ? '🟢' : '🔴'} <b>REVERSAL SIGNAL — ${dir}</b>\n` +
                 `WR:            <code>${wr[i].toFixed(1)}</code>\n` +
@@ -304,10 +236,9 @@ async function processCandles(candles, wr) {
                 `Entry fills at next candle open…`
               );
             }
-            // Same direction as open trade: ignore
           } else {
             state.pendingSignal = { direction: dir };
-            await saveState();
+            saveState();
             sendTelegram(
               `${dir === 'LONG' ? '🟢' : '🔴'} <b>SIGNAL FIRED — ${dir}</b>\n` +
               `WR:            <code>${wr[i].toFixed(1)}</code>\n` +
@@ -329,15 +260,12 @@ async function processCandles(candles, wr) {
   }
 
   state.lastCandleOpen = lastClosed.time;
-  await saveState();
+  saveState();
 }
 
 // ─── HELPERS ────────────────────────────────────────────────
 function f2(n) {
-  return Number(n).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+  return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtDate(iso) {
@@ -375,15 +303,8 @@ function calcStats() {
     if (t.result === 'win')       { curW++; curL = 0; maxConsecWins = Math.max(maxConsecWins, curW); }
     else if (t.result === 'loss') { curL++; curW = 0; maxConsecLoss = Math.max(maxConsecLoss, curL); }
   }
-
-  return {
-    balance, ret, wins, losses,
-    total: trades.length,
-    winRate, pf, maxDd,
-    avgWin, avgLoss,
-    maxConsecWins, maxConsecLoss,
-    grossWin, grossLoss,
-  };
+  return { balance, ret, wins, losses, total: trades.length, winRate, pf, maxDd,
+           avgWin, avgLoss, maxConsecWins, maxConsecLoss, grossWin, grossLoss };
 }
 
 // ─── COMMAND HANDLERS ───────────────────────────────────────
@@ -391,10 +312,7 @@ function handleStats() {
   const s      = calcStats();
   const price  = lastCandles.length ? lastCandles[lastCandles.length - 1].close : null;
   const wrNow  = lastWR !== null ? lastWR.toFixed(1) : '—';
-  const wrZone = lastWR === null    ? '—'
-    : lastWR >= -20                 ? '🔴 OVERBOUGHT'
-    : lastWR <= -80                 ? '🟢 OVERSOLD'
-    :                                 '⚪ NEUTRAL';
+  const wrZone = lastWR === null ? '—' : lastWR >= -20 ? '🔴 OVERBOUGHT' : lastWR <= -80 ? '🟢 OVERSOLD' : '⚪ NEUTRAL';
 
   let chikouStr = '—';
   if (lastCandles.length > CHIKOU_SHIFT) {
@@ -412,12 +330,9 @@ function handleStats() {
   }
 
   const pendingLine = state.pendingSignal
-    ? `\n⏳ Pending Entry: <code>${state.pendingSignal.direction}</code> at next candle open`
-    : '';
-
+    ? `\n⏳ Pending Entry: <code>${state.pendingSignal.direction}</code> at next candle open` : '';
   const openLine = state.openTrade
-    ? `${state.openTrade.direction} @ <code>$${f2(state.openTrade.entryPrice)}</code>`
-    : 'None';
+    ? `${state.openTrade.direction} @ <code>$${f2(state.openTrade.entryPrice)}</code>` : 'None';
   const retSign = s.ret >= 0 ? '+' : '';
 
   return (
@@ -447,13 +362,8 @@ function handleStats() {
 function handlePosition() {
   if (!state.openTrade) {
     const pendingLine = state.pendingSignal
-      ? `\n⏳ <b>Pending:</b> ${state.pendingSignal.direction} entry queued for next candle open.`
-      : '';
-    return (
-      `💤 <b>No open trade right now.</b>${pendingLine}\n\n` +
-      `The bot is watching for the next Williams %R signal…\n` +
-      `Send /stats to check indicators.`
-    );
+      ? `\n⏳ <b>Pending:</b> ${state.pendingSignal.direction} entry queued for next candle open.` : '';
+    return `💤 <b>No open trade right now.</b>${pendingLine}\n\nThe bot is watching for the next signal…\nSend /stats to check indicators.`;
   }
 
   const t     = state.openTrade;
@@ -461,15 +371,10 @@ function handlePosition() {
   const dir   = t.direction === 'LONG' ? 1 : -1;
   const emoji = t.direction === 'LONG' ? '🟢' : '🔴';
   const upnl  = price ? (price - t.entryPrice) * t.sizeBTC * dir : null;
-
   const distSL = price ? Math.abs(((price - t.sl) / price) * 100).toFixed(2) : '—';
   const distTP = price ? Math.abs(((t.tp - price) / price) * 100).toFixed(2) : '—';
-
   const durationMin = Math.floor((Date.now() - new Date(t.entryTime).getTime()) / 60000);
-  const durationStr = durationMin >= 60
-    ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m`
-    : `${durationMin}m`;
-
+  const durationStr = durationMin >= 60 ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m` : `${durationMin}m`;
   const rMult    = upnl !== null ? (upnl / RISK_USD).toFixed(2) : '—';
   const upnlLine = upnl !== null
     ? `<code>${upnl >= 0 ? '+' : '-'}$${f2(Math.abs(upnl))}</code>  <code>(${upnl >= 0 ? '+' : ''}${rMult}R)</code>  ${upnl >= 0 ? '📈' : '📉'}`
@@ -499,17 +404,12 @@ function handleHistory(n = 20) {
   const s       = calcStats();
   const retSign = s.ret >= 0 ? '+' : '';
 
-  const header =
-    `📋 <b>TRADE HISTORY — Last ${recent.length}</b>\n` +
-    `━━━━━━━━━━━━━━━━━━━━━\n`;
-
+  const header = `📋 <b>TRADE HISTORY — Last ${recent.length}</b>\n━━━━━━━━━━━━━━━━━━━━━\n`;
   const footer =
     `━━━━━━━━━━━━━━━━━━━━━\n` +
     `Showing <code>${recent.length}</code> of <code>${trades.length}</code> total\n` +
     `Balance: <code>$${f2(s.balance)}</code>  <code>${retSign}${s.ret.toFixed(2)}%</code>\n` +
-    `W/L: <code>${s.wins}/${s.losses}</code>  ` +
-    `WR: <code>${s.winRate !== null ? s.winRate.toFixed(1) + '%' : '—'}</code>  ` +
-    `PF: <code>${s.pf !== null ? s.pf.toFixed(2) + 'x' : '—'}</code>`;
+    `W/L: <code>${s.wins}/${s.losses}</code>  WR: <code>${s.winRate !== null ? s.winRate.toFixed(1) + '%' : '—'}</code>  PF: <code>${s.pf !== null ? s.pf.toFixed(2) + 'x' : '—'}</code>`;
 
   const lines = recent.map(t => {
     const emoji   = t.result === 'win' ? '✅' : t.result === 'loss' ? '❌' : '⚪';
@@ -524,7 +424,6 @@ function handleHistory(n = 20) {
     );
   });
 
-  // Chunk into pages under 3800 chars (safe below Telegram's 4096 limit)
   const pages = [];
   let current = header;
   for (let i = 0; i < lines.length; i++) {
@@ -539,7 +438,6 @@ function handleHistory(n = 20) {
       current = `📋 <b>TRADE HISTORY (cont.)</b>\n━━━━━━━━━━━━━━━━━━━━━\n` + lines[i];
     }
   }
-
   return pages;
 }
 
@@ -573,9 +471,9 @@ async function sendTelegram(text, chatId = TELEGRAM_CHAT_ID) {
   }
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
     });
     if (!res.ok) console.error('Telegram API error:', await res.text());
   } catch (e) { console.error('Telegram send error:', e.message); }
@@ -593,8 +491,7 @@ async function pollCommands() {
   if (!TELEGRAM_TOKEN) return;
   try {
     const res = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates` +
-      `?offset=${pollingOffset}&timeout=20&allowed_updates=["message"]`,
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${pollingOffset}&timeout=20&allowed_updates=["message"]`,
       { signal: AbortSignal.timeout(25000) }
     );
     if (!res.ok) return;
@@ -605,7 +502,6 @@ async function pollCommands() {
       pollingOffset = update.update_id + 1;
       const msg = update.message;
       if (!msg || !msg.text) continue;
-
       const chatId = String(msg.chat.id);
       const text   = msg.text.trim().toLowerCase().split('@')[0];
 
@@ -616,22 +512,14 @@ async function pollCommands() {
 
       console.log(`[CMD] ${chatId}: ${text}`);
 
-      if (text === '/stats' || text === '/start') {
-        await sendReply(handleStats(), chatId);
-      } else if (text === '/position' || text === '/pos') {
-        await sendReply(handlePosition(), chatId);
-      } else if (text.startsWith('/history')) {
-        const parts = text.split(' ');
-        const n     = Math.min(Math.max(parseInt(parts[1]) || 20, 1), 50);
+      if      (text === '/stats' || text === '/start') await sendReply(handleStats(), chatId);
+      else if (text === '/position' || text === '/pos') await sendReply(handlePosition(), chatId);
+      else if (text.startsWith('/history')) {
+        const n = Math.min(Math.max(parseInt(text.split(' ')[1]) || 20, 1), 50);
         await sendReply(handleHistory(n), chatId);
-      } else if (text === '/help') {
-        await sendReply(handleHelp(), chatId);
-      } else {
-        await sendTelegram(
-          `❓ Unknown command: <code>${msg.text}</code>\n\nSend /help to see available commands.`,
-          chatId
-        );
       }
+      else if (text === '/help') await sendReply(handleHelp(), chatId);
+      else await sendTelegram(`❓ Unknown command: <code>${msg.text}</code>\n\nSend /help to see available commands.`, chatId);
     }
   } catch (e) {
     if (!e.message.includes('timeout') && !e.message.includes('abort'))
@@ -650,9 +538,9 @@ async function registerCommands() {
   if (!TELEGRAM_TOKEN) return;
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setMyCommands`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
+      body: JSON.stringify({
         commands: [
           { command: 'stats',    description: 'Full performance stats & indicators' },
           { command: 'position', description: 'Current open trade & live P&L' },
@@ -675,9 +563,8 @@ async function tick() {
     lastCandles   = candles;
     lastWR        = wr[wr.length - 2] ?? null;
 
-    await processCandles(candles, wr);
+    processCandles(candles, wr);
 
-    // Daily status at 00:00 UTC
     const now    = new Date();
     const dayKey = now.toISOString().slice(0, 10);
     if (now.getUTCHours() === 0 && now.getUTCMinutes() === 0 && dailyReportSentForDay !== dayKey) {
@@ -699,55 +586,34 @@ async function tick() {
   }
 }
 
-// ─── HTTP API SERVER ─────────────────────────────────────────
+// ─── HTTP API ────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
-
-app.get('/state', (req, res) => res.json({
-  balance:        state.balance,
-  trades:         state.trades,
-  openTrade:      state.openTrade,
-  pendingSignal:  state.pendingSignal,
-  initialBalance: INITIAL_BALANCE,
-  updatedAt:      new Date().toISOString(),
+app.get('/state',  (req, res) => res.json({
+  balance: state.balance, trades: state.trades,
+  openTrade: state.openTrade, pendingSignal: state.pendingSignal,
+  initialBalance: INITIAL_BALANCE, updatedAt: new Date().toISOString(),
 }));
 app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
-app.listen(PORT, () => console.log(`API server listening on port ${PORT}`));
+app.listen(PORT,   () => console.log(`API server listening on port ${PORT}`));
 
 // ─── START ──────────────────────────────────────────────────
-async function main() {
-  console.log('🤖 BTC Paper Trader Bot starting…');
-  console.log(`   Telegram:   ${TELEGRAM_TOKEN   ? 'configured ✅' : 'NOT SET ⚠️'}`);
-  console.log(`   Chat ID:    ${TELEGRAM_CHAT_ID ? 'configured ✅' : 'NOT SET ⚠️'}`);
-  console.log(`   Database:   ${process.env.DATABASE_URL ? 'configured ✅' : 'NOT SET ⚠️'}`);
-  console.log(`   Candle limit: ${CANDLE_LIMIT}`);
+console.log('🤖 BTC Paper Trader Bot starting…');
+console.log(`   Telegram:     ${TELEGRAM_TOKEN   ? 'configured ✅' : 'NOT SET ⚠️'}`);
+console.log(`   Chat ID:      ${TELEGRAM_CHAT_ID ? 'configured ✅' : 'NOT SET ⚠️'}`);
+console.log(`   Candle limit: ${CANDLE_LIMIT}`);
+if (state.pendingSignal) console.log(`   Restored pending signal: ${state.pendingSignal.direction}`);
 
-  // Connect to DB and load persisted state
-  await dbInit();
-  state = await loadState();
+await registerCommands();
+await sendTelegram(
+  '🤖 <b>BTC Paper Trader Bot started</b>\n' +
+  'Monitoring BTC/USDT 15m…\n' +
+  'Strategy: Williams %R + Ichimoku Chikou\n' +
+  (state.pendingSignal ? `\n⏳ Restored pending <b>${state.pendingSignal.direction}</b> entry from before restart.` : '') +
+  '\n\nSend /help for available commands.'
+);
 
-  if (state.pendingSignal) {
-    console.log(`   Restored pending signal: ${state.pendingSignal.direction}`);
-  }
-
-  await registerCommands();
-  await sendTelegram(
-    '🤖 <b>BTC Paper Trader Bot started</b>\n' +
-    'Monitoring BTC/USDT 15m…\n' +
-    'Strategy: Williams %R + Ichimoku Chikou\n' +
-    (state.pendingSignal
-      ? `\n⏳ Restored pending <b>${state.pendingSignal.direction}</b> entry from before restart.`
-      : '') +
-    '\n\nSend /help for available commands.'
-  );
-
-  tick();
-  setInterval(tick, POLL_INTERVAL_MS);
-  startPolling();
-}
-
-main().catch(e => {
-  console.error('Fatal startup error:', e.message);
-  process.exit(1);
-});
+tick();
+setInterval(tick, POLL_INTERVAL_MS);
+startPolling();
