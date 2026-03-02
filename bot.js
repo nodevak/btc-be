@@ -33,9 +33,8 @@ const CANDLE_LIMIT     = 50;
 // ─── POSTGRES ───────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('railway')
-    ? { rejectUnauthorized: false }
-    : false,
+  // Neon and most hosted Postgres providers require SSL
+  ssl: { rejectUnauthorized: false },
 });
 
 // One table, one row — stores the entire bot state as JSONB.
