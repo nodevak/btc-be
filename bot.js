@@ -56,7 +56,7 @@ function saveState() {
 
 // ─── BINANCE API ────────────────────────────────────────────
 async function fetchCandles() {
-  const res = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=500');
+  const res = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=100');
   if (!res.ok) throw new Error(`Binance API returned ${res.status}`);
   const data = await res.json();
   return data.map(k => ({
