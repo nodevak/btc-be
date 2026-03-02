@@ -1,0 +1,15 @@
+{
+  "name": "btc-trader-bot",
+  "version": "1.0.0",
+  "description": "BTC/USDT Paper Trading Bot — Williams %R + Ichimoku Chikou",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  }
+}
