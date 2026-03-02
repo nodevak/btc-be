@@ -1,2 +1,3 @@
-echo "node_modules/"
-echo "state.json"
+echo node_modules/ >> .gitignore
+echo state.json >> .gitignore
+echo .env >> .gitignore
